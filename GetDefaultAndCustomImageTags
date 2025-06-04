@@ -1,0 +1,127 @@
+// ===== ENVIRONMENT VARIABLES =====
+// 1. CUSTOM_MODEL_ARN: ARN of your trained Rekognition Custom Labels model (e.g., "arn:aws:rekognition:us-east-1:123456789012:project/my-custom-project/version/my-custom-model/1234567890123")
+// 2. MIN_CONFIDENCE_DEFAULT: (optional) Minimum confidence threshold for default labels (default: 0.65)
+// 3. MIN_CONFIDENCE_CUSTOM: (optional) Minimum confidence threshold for custom labels (default: 0.65)
+// ==========================================
+
+// ===== IAM PERMISSIONS =====
+// The Lambda execution role must have the following permissions:
+// - rekognition:DetectLabels
+// - rekognition:DetectCustomLabels
+// - rekognition:DescribeProjectVersions
+// - rekognition:DescribeProjects
+// - (Optional) logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents for logging
+// ====================================
+
+// ===== CONFIGURATION SETTINGS =====
+// 1. Increase the Lambda Memory Size to at least 256MB or more, depending on the image size.
+// ====================================
+
+import { RekognitionClient, DetectLabelsCommand, DetectCustomLabelsCommand } from "@aws-sdk/client-rekognition";
+import https from "https";
+
+const rekognition = new RekognitionClient({});
+
+const CUSTOM_MODEL_ARN = process.env.CUSTOM_MODEL_ARN;
+if (!CUSTOM_MODEL_ARN) {
+  throw new Error("CUSTOM_MODEL_ARN environment variable must be set to your custom model ARN.");
+}
+
+const MIN_CONFIDENCE_DEFAULT = process.env.MIN_CONFIDENCE_DEFAULT
+  ? parseFloat(process.env.MIN_CONFIDENCE_DEFAULT)
+  : 0.65;
+
+const MIN_CONFIDENCE_CUSTOM = process.env.MIN_CONFIDENCE_CUSTOM
+  ? parseFloat(process.env.MIN_CONFIDENCE_CUSTOM)
+  : 0.65;
+
+function fetchImageBuffer(url) {
+  return new Promise((resolve, reject) => {
+    console.log(`Fetching image from URL: ${url}`);
+    https.get(url, (res) => {
+      const data = [];
+      res.on("data", (chunk) => data.push(chunk));
+      res.on("end", () => {
+        console.log(`Fetched image, total bytes: ${data.reduce((acc, chunk) => acc + chunk.length, 0)}`);
+        resolve(Buffer.concat(data));
+      });
+      res.on("error", (err) => {
+        console.error("Error while receiving image data:", err);
+        reject(err);
+      });
+    }).on("error", (err) => {
+      console.error("HTTPS request error:", err);
+      reject(err);
+    });
+  });
+}
+
+export const handler = async (event) => {
+  try {
+    console.log("Received event:", JSON.stringify(event));
+    const { imageUrl } = event;
+    if (!imageUrl) {
+      throw new Error("imageUrl is missing from event");
+    }
+    console.log("Parsed imageUrl:", imageUrl);
+
+    // Download image as bytes
+    const imageBytes = await fetchImageBuffer(imageUrl);
+
+    // Call Rekognition for default labels
+    const defaultParams = {
+      Image: { Bytes: imageBytes },
+      MaxLabels: 10,
+      MinConfidence: MIN_CONFIDENCE_DEFAULT * 100, // Rekognition expects 0-100
+    };
+    console.log("Calling Rekognition DetectLabels with params:", JSON.stringify({ ...defaultParams, Image: { Bytes: `Buffer(${imageBytes.length} bytes)` } }));
+
+    const defaultCommand = new DetectLabelsCommand(defaultParams);
+    const defaultResult = await rekognition.send(defaultCommand);
+
+    console.log("Rekognition DetectLabels result:", JSON.stringify(defaultResult));
+
+    const defaultPredictions = (defaultResult.Labels || [])
+      .filter(label => (label.Confidence / 100) >= MIN_CONFIDENCE_DEFAULT)
+      .map(label => ({
+        probability: label.Confidence / 100,
+        tagName: label.Name,
+        source: "default"
+      }));
+
+    // Call Rekognition for custom labels
+    const customParams = {
+      Image: { Bytes: imageBytes },
+      ProjectVersionArn: CUSTOM_MODEL_ARN,
+      MinConfidence: MIN_CONFIDENCE_CUSTOM * 100, // Rekognition expects 0-100
+    };
+    console.log("Calling Rekognition DetectCustomLabels with params:", JSON.stringify({ ...customParams, Image: { Bytes: `Buffer(${imageBytes.length} bytes)` } }));
+
+    const customCommand = new DetectCustomLabelsCommand(customParams);
+    const customResult = await rekognition.send(customCommand);
+
+    console.log("Rekognition DetectCustomLabels result:", JSON.stringify(customResult));
+
+    const customPredictions = (customResult.CustomLabels || [])
+      .filter(label => (label.Confidence / 100) >= MIN_CONFIDENCE_CUSTOM)
+      .map(label => ({
+        probability: label.Confidence / 100,
+        tagName: label.Name,
+        source: "custom"
+      }));
+
+    // Combine results
+    const predictions = [...defaultPredictions, ...customPredictions];
+
+    return {
+      statusCode: 200,
+      body: JSON.stringify({ predictions }),
+    };
+  } catch (error) {
+    console.error("Handler error:", error);
+    return {
+      statusCode: 500,
+      body: JSON.stringify({ error: error.message }),
+    };
+  }
+};
